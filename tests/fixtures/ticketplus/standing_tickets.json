@@ -1,0 +1,6 @@
+{
+  "ticket_units": [
+    {"key": "s-zone", "name": "S區", "price_text": "NT$4,000", "price": 4000, "status": "可售", "available": true, "max_quantity": 4, "general_admission": true},
+    {"key": "general", "name": "一般區", "price_text": "NT$2,500", "price": 2500, "status": "可售", "available": true, "max_quantity": 4, "general_admission": true}
+  ]
+}

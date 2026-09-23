@@ -1,0 +1,627 @@
+"""Ticket Plus（遠大售票）瀏覽器流程。
+
+此模組只操作可見 DOM，建立訂單後停在付款邊界。登入、排隊與人工驗證
+都交由使用者或網站原生流程處理，不讀取 Cookie、儲存空間或付款欄位。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+from urllib.parse import urlparse
+
+from ticket_bot.browser import BrowserEngine, PageWrapper, create_engine
+from ticket_bot.config import AppConfig, EventConfig, SessionConfig
+from ticket_bot.platforms.ticketplus_parser import (
+    build_ticket_plan,
+    detect_page_state,
+    select_adjacent_seats,
+    select_session,
+    ticket_units_from_order_areas,
+    validate_order_review,
+)
+
+logger = logging.getLogger(__name__)
+
+TICKETPLUS_HOME_URL = "https://ticketplus.com.tw/"
+MAX_STATE_STEPS = 80
+MAX_QUEUE_STEPS = 2400
+STATE_POLL_SECONDS = 0.25
+TICKETPLUS_SESSION_SELECTOR = (
+    "[data-session-id], .session-item, .sesstion-item, .event-session, tr, .card"
+)
+TICKETPLUS_TICKET_SELECTOR = (
+    "[data-ticket-id], [data-price], .ticket-unit, .ticket-item, .price-item, tr"
+)
+
+
+def is_payment_boundary(page_url: str, has_payment_action: bool) -> bool:
+    """只有結帳路徑上的付款動作才算付款邊界。"""
+    path = urlparse(page_url).path.casefold()
+    is_checkout_path = bool(
+        re.search(r"/(?:order|checkout|payment|cart)(?:/|$)", path)
+    )
+    return is_checkout_path and has_payment_action
+
+
+_SNAPSHOT_JS = r"""
+(function ticketPlusSnapshot() {
+  const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+  const body = clean(document.body && document.body.innerText);
+  const visible = element => {
+    if (!element) return false;
+    const style = getComputedStyle(element);
+    return style.display !== 'none' && style.visibility !== 'hidden';
+  };
+  const priceOf = text => {
+    if (/免費/.test(text)) return 0;
+    const hits = [...text.matchAll(/(?:NT(?:\$|\.)?|TWD\$?|\$)\s*([0-9][0-9,]*)/gi)];
+    return hits.length ? Number(hits[hits.length - 1][1].replace(/,/g, '')) : null;
+  };
+  const unusable = text => /售完|已售完|完售|sold\s*out|不可購買|停止販售/i.test(text);
+  const keyFor = (element, prefix, index) => {
+    const key = clean(element.dataset.ticketBotKey || element.dataset.sessionId ||
+      element.dataset.ticketId || element.dataset.id || element.id || `${prefix}-${index}`);
+    element.dataset.ticketBotKey = key;
+    return key;
+  };
+
+  const password = [...document.querySelectorAll('input[type="password"]')].some(visible);
+  const loginDialog = [...document.querySelectorAll('[role="dialog"], .modal, .dialog')]
+    .filter(visible).some(el => /登入|手機號碼|密碼/.test(clean(el.innerText)));
+  const loggedIn = /[0-9]{3,4}\*{2,}[0-9]{3}[^]{0,80}登出/.test(body);
+  const loginRequired = !loggedIn && (password || loginDialog);
+  const queue = /流量管制|排隊(?:購票)?中|等候進入|queue|waiting room/i.test(body);
+  const transientError = /您的操作好像出了一點問題|操作發生錯誤[^]{0,30}稍後再試/i.test(body);
+  const verificationRequired = /人機驗證|安全驗證|驗證碼|captcha|turnstile/i.test(body);
+  const saleNotStarted = /尚未開賣|開賣時間|即將開賣|coming soon/i.test(body);
+
+  const sessions = [];
+  [...document.querySelectorAll('__TICKETPLUS_SESSION_SELECTOR__')]
+    .filter(visible).forEach((element, index) => {
+      const text = clean(element.innerText);
+      if (!text || text.length > 1200 || !(/立即購買|購票|尚未開賣|售完/.test(text))) return;
+      const date = (text.match(/20\d{2}[\/.\-年]\s*\d{1,2}[\/.\-月]\s*\d{1,2}日?(?:\([^)]*\))?/) || [''])[0];
+      sessions.push({
+        key: keyFor(element, 'session', index), name: text, date,
+        status: unusable(text) ? '售完' : (/尚未開賣/.test(text) ? '尚未開賣' : '立即購買'),
+        available: !unusable(text) && !/尚未開賣/.test(text)
+      });
+    });
+
+  const ticketUnits = [];
+  const ticketCandidates = [...document.querySelectorAll('__TICKETPLUS_TICKET_SELECTOR__')];
+  [...document.querySelectorAll('input[type="radio"], [role="radio"]')].forEach(control => {
+    let candidate = control;
+    for (let depth = 0; candidate && depth < 7; depth += 1, candidate = candidate.parentElement) {
+      const text = clean(candidate.innerText);
+      if (text && text.length <= 800 && priceOf(text) !== null) {
+        ticketCandidates.push(candidate);
+        break;
+      }
+    }
+  });
+  [...new Set(ticketCandidates)]
+    .filter(visible).forEach((element, index) => {
+      const text = clean(element.innerText);
+      const price = priceOf(text);
+      if (price === null || !text || text.length > 1600) return;
+      const control = element.querySelector('select, input[type="number"], input[type="text"]');
+      const radio = element.matches('input[type="radio"], [role="radio"]') ? element :
+        element.querySelector('input[type="radio"], [role="radio"]');
+      const plus = [...element.querySelectorAll('button, a')].find(el => /\+|增加|加/.test(clean(el.innerText) || el.getAttribute('aria-label') || ''));
+      const remainingMatch = text.match(/剩餘\s*([0-9]+)/i);
+      const radioDisabled = radio && (radio.disabled || radio.getAttribute('aria-disabled') === 'true' ||
+        /disabled/.test(clean(radio.className && (radio.className.baseVal || radio.className))));
+      let maxQuantity = 0;
+      if (remainingMatch) {
+        maxQuantity = Number(remainingMatch[1]);
+      } else if (control && control.tagName === 'SELECT') {
+        maxQuantity = Math.max(0, ...[...control.options].map(option => Number(option.value) || 0));
+      } else if (control) {
+        maxQuantity = Number(control.max || control.getAttribute('max')) || 10;
+      } else if (plus) {
+        maxQuantity = 10;
+      } else if (radio && !radioDisabled) {
+        // 票區頁只選區域，實際張數會在下一階段決定。
+        maxQuantity = 99;
+      }
+      const name = clean((element.querySelector('[data-ticket-name], .ticket-name, .name, th, td') || element).innerText);
+      ticketUnits.push({
+        key: keyFor(element, 'ticket', index), name, price_text: text, price,
+        status: unusable(text) ? '售完' : '可售',
+        available: !unusable(text) && !radioDisabled && maxQuantity > 0,
+        max_quantity: maxQuantity,
+        general_admission: /自由入座|自由席|站席|搖滾區|無劃位|一般區/i.test(text),
+        selection_mode: radio ? 'area' : 'quantity'
+      });
+    });
+
+  const seatNodes = [...document.querySelectorAll(
+    '[data-seat-id], [data-seat-number], [data-seat-no], .seat[data-row], svg [data-seat]'
+  )].filter(visible);
+  const seats = seatNodes.map((element, index) => {
+    const text = clean(element.getAttribute('aria-label') || element.title || element.innerText);
+    const classText = clean(element.className && (element.className.baseVal || element.className));
+    const seatNumber = clean(element.dataset.seatNumber || element.dataset.seatNo ||
+      (text.match(/(?:座號|seat|no\.?)[：:\s]*([0-9]+)/i) || [,''])[1]);
+    const row = clean(element.dataset.row || (text.match(/(?:排|row)[：:\s]*([A-Za-z0-9]+)/i) || [,''])[1]);
+    const area = clean(element.dataset.area || element.dataset.zone ||
+      (element.closest('[data-area], [data-zone]') || {}).dataset?.area || '');
+    return {
+      key: keyFor(element, 'seat', index), area, row, seat_number: seatNumber,
+      price: priceOf(text), available: !unusable(text) && !/disabled|selected/.test(classText),
+      selectable: !element.disabled && element.getAttribute('aria-disabled') !== 'true'
+    };
+  });
+  const seatMap = seats.length > 0 || Boolean(document.querySelector('canvas, svg.seat-map, [class*="seat-map"]'));
+
+  const paymentAction = [...document.querySelectorAll('button, a')]
+    .filter(visible)
+    .some(element => /前往付款|立即付款|選擇付款|信用卡付款|ATM付款/i.test(clean(element.innerText)));
+  const orderReview = /訂單明細|票券明細|訂購明細|訂單確認/i.test(body);
+  const numberAfter = label => {
+    const match = body.match(new RegExp('(?:' + label + ')[^0-9]{0,20}([0-9][0-9,]*)', 'i'));
+    return match ? Number(match[1].replace(/,/g, '')) : null;
+  };
+  const selectedName = clean((document.querySelector(
+    '[data-selected-ticket-name], .order-ticket-name, .cart-ticket-name, .ticket-name, [class*="ticket-name"]'
+  ) || {}).innerText);
+  const quantityMatch = body.match(/(?:數量|張數|quantity)[^0-9]{0,12}([0-9]+)/i) || body.match(/x\s*([0-9]+)/i);
+  const priceCandidates = [...document.querySelectorAll('body *')]
+    .filter(element => {
+      const text = clean(element.innerText);
+      return visible(element) && text.length <= 100 && /(?:NT(?:\$|\.)?|TWD\$?|\$)\s*[0-9][0-9,]*/i.test(text);
+    })
+    .slice(0, 12)
+    .map(element => ({
+      tag: element.tagName,
+      class_name: clean(element.className && (element.className.baseVal || element.className)),
+      text: clean(element.innerText),
+      parent_tag: element.parentElement && element.parentElement.tagName,
+      parent_class: clean(element.parentElement && element.parentElement.className &&
+        (element.parentElement.className.baseVal || element.parentElement.className)),
+      parent_text: clean(element.parentElement && element.parentElement.innerText).slice(0, 300)
+    }));
+  const orderAreas = [...document.querySelectorAll('.seats-area .v-expansion-panel')]
+    .filter(visible)
+    .map((element, index) => {
+      const header = element.querySelector('button.v-expansion-panel-header');
+      return {
+        key: keyFor(element, 'ticket-area', index),
+        text: clean(element.innerText),
+        disabled: !header || header.disabled || header.getAttribute('aria-disabled') === 'true' ||
+          /disabled/.test(clean(header.className))
+      };
+    });
+
+  return {
+    page_url: location.href, title: document.title, logged_in: loggedIn,
+    login_required: loginRequired, transient_error: transientError,
+    sale_not_started: saleNotStarted, queue, sessions, ticket_units: ticketUnits,
+    seat_map: seatMap, seats, order_review: orderReview,
+    ticket_name: selectedName, quantity: quantityMatch ? Number(quantityMatch[1]) : null,
+    subtotal: numberAfter('票款小計|小計|subtotal'), fees: numberAfter('手續費|系統服務費|fees?'),
+    total: numberAfter('總計|總額|total'), payment_action: paymentAction,
+    verification_required: verificationRequired,
+    body_excerpt: body.slice(0, 1200), price_candidates: priceCandidates,
+    order_areas: orderAreas
+  };
+})()
+""".replace("__TICKETPLUS_SESSION_SELECTOR__", TICKETPLUS_SESSION_SELECTOR).replace(
+    "__TICKETPLUS_TICKET_SELECTOR__", TICKETPLUS_TICKET_SELECTOR
+)
+
+
+class TicketPlusBot:
+    """以瀏覽器操作遠大售票，並在付款前停止。"""
+
+    def __init__(
+        self,
+        config: AppConfig,
+        event: EventConfig,
+        session: SessionConfig | None = None,
+    ):
+        self.config = config
+        self.event = event
+        self.session = session
+        self.engine: BrowserEngine = create_engine(config.browser.engine)
+        self.page: PageWrapper | None = None
+        self.last_success_info = ""
+        self.last_error = ""
+        self._ticket_plan: dict | None = None
+        self._last_snapshot_diagnostic = ""
+        self._selected_session_key: str | None = None
+
+    async def start_browser(self) -> None:
+        user_data_dir = self.session.user_data_dir if self.session else self.config.browser.user_data_dir
+        await self.engine.launch(
+            headless=self.config.browser.headless,
+            user_data_dir=user_data_dir,
+            executable_path=self.config.browser.executable_path,
+            lang=self.config.browser.lang,
+            proxy_server=self.session.proxy_server if self.session else "",
+        )
+
+    async def _ensure_page(self) -> PageWrapper:
+        if self.page is None:
+            await self.start_browser()
+            self.page = await self.engine.new_page()
+        return self.page
+
+    async def open_login_page(self) -> None:
+        page = await self._ensure_page()
+        await page.goto(TICKETPLUS_HOME_URL)
+        logger.info("已開啟 Ticket Plus，請在瀏覽器手動登入；登入狀態會保存在瀏覽器 profile。")
+
+    async def _snapshot(self) -> dict:
+        if self.page is None:
+            raise RuntimeError("Ticket Plus 頁面尚未建立")
+        result = await self.page.evaluate(_SNAPSHOT_JS)
+        if not isinstance(result, dict):
+            return {}
+        if "payment_action" in result:
+            page_url = str(result.get("page_url", ""))
+            result["payment_boundary"] = is_payment_boundary(
+                page_url,
+                bool(result.pop("payment_action")),
+            )
+            if not is_payment_boundary(page_url, True):
+                result["order_review"] = False
+        if not result.get("ticket_units") and result.get("order_areas"):
+            result["ticket_units"] = ticket_units_from_order_areas(
+                result["order_areas"]
+            )
+        return result
+
+    async def _select_session(self, key: str) -> None:
+        if self.page is None:
+            raise RuntimeError("Ticket Plus 頁面尚未建立")
+        key_json = json.dumps(key, ensure_ascii=False)
+        script = rf"""
+        (() => {{
+          window.ticketPlusSelectSession = window.ticketPlusSelectSession || (key => {{
+            const row = [...document.querySelectorAll('[data-ticket-bot-key]')]
+              .find(element => element.dataset.ticketBotKey === key);
+            if (!row) return false;
+            const target = row.matches('button, a') ? row : row.querySelector('button, a');
+            if (!target || /尚未開賣|售完/.test(target.innerText || row.innerText)) return false;
+            target.click(); return true;
+          }});
+          return window.ticketPlusSelectSession({key_json});
+        }})()
+        """
+        if await self.page.evaluate(script) is not True:
+            raise RuntimeError(f"Ticket Plus 無法選擇場次: {key}")
+
+    async def _select_ticket(self, plan: dict) -> None:
+        if self.page is None:
+            raise RuntimeError("Ticket Plus 頁面尚未建立")
+        payload = json.dumps(plan, ensure_ascii=False)
+        key_json = json.dumps(plan["ticket_key"], ensure_ascii=False)
+        script = rf"""
+        (() => {{
+          window.ticketPlusSelectTickets = window.ticketPlusSelectTickets || (plan => {{
+            const row = [...document.querySelectorAll('[data-ticket-bot-key]')]
+              .find(element => element.dataset.ticketBotKey === plan.ticket_key);
+            if (!row) return false;
+            const radio = row.matches('input[type="radio"], [role="radio"]') ? row :
+              row.querySelector('input[type="radio"], [role="radio"]');
+            if (plan.selection_mode === 'area_panel') {{
+              const header = row.querySelector('button.v-expansion-panel-header');
+              if (!header || header.disabled || header.getAttribute('aria-disabled') === 'true') return false;
+              header.click();
+              return true;
+            }}
+            if (plan.selection_mode === 'area') {{
+              if (!radio || radio.disabled || radio.getAttribute('aria-disabled') === 'true') return false;
+              const target = radio.closest('label') || radio;
+              target.click();
+              return true;
+            }}
+            const select = row.querySelector('select');
+            const input = row.querySelector('input[type="number"], input[type="text"]');
+            if (select) {{
+              select.value = String(plan.quantity);
+              select.dispatchEvent(new Event('change', {{bubbles: true}}));
+            }} else if (input) {{
+              const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+              setter.call(input, String(plan.quantity));
+              input.dispatchEvent(new Event('input', {{bubbles: true}}));
+              input.dispatchEvent(new Event('change', {{bubbles: true}}));
+            }} else {{
+              const plus = [...row.querySelectorAll('button, a')]
+                .find(el => /\+|增加|加/.test((el.innerText || el.getAttribute('aria-label') || '').trim()));
+              if (!plus) return false;
+              for (let index = 0; index < plan.quantity; index += 1) plus.click();
+            }}
+            return true;
+          }});
+          return window.ticketPlusSelectTickets({payload});
+        }})()
+        """
+        if await self.page.evaluate(script) is not True:
+            raise RuntimeError(f"Ticket Plus 無法選擇票種: {plan['ticket_name']}")
+
+        if plan.get("selection_mode") == "area_panel":
+            quantity_payload = json.dumps(
+                {
+                    "ticket_key": plan["ticket_key"],
+                    "quantity": plan["quantity"],
+                },
+                ensure_ascii=False,
+            )
+            quantity_script = rf"""
+            (() => {{
+              window.ticketPlusAdjustAreaQuantity = window.ticketPlusAdjustAreaQuantity || (plan => {{
+                const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+                const row = [...document.querySelectorAll('[data-ticket-bot-key]')]
+                  .find(element => element.dataset.ticketBotKey === plan.ticket_key);
+                const counter = row && row.querySelector('.count-button');
+                if (!counter) return {{ready: false, current: null, done: false}};
+                const numberNode = [...counter.children].find(element =>
+                  element.tagName !== 'BUTTON' && /^\d+$/.test(clean(element.innerText)));
+                if (!numberNode) return {{ready: false, current: null, done: false}};
+                const current = Number(clean(numberNode.innerText));
+                if (current === plan.quantity) {{
+                  return {{ready: true, current, done: true, clicked: false}};
+                }}
+                const iconClass = current < plan.quantity ? 'mdi-plus' : 'mdi-minus';
+                const button = [...counter.querySelectorAll('button')].find(element =>
+                  element.querySelector(`i.${{iconClass}}`));
+                const disabled = !button || button.disabled ||
+                  button.getAttribute('aria-disabled') === 'true' ||
+                  /disabled/.test(clean(button && button.className));
+                if (disabled) {{
+                  return {{ready: true, current, done: false, clicked: false}};
+                }}
+                button.click();
+                return {{ready: true, current, done: false, clicked: true}};
+              }});
+              return window.ticketPlusAdjustAreaQuantity({quantity_payload});
+            }})()
+            """
+            last_quantity_state: object = None
+            for _ in range(30):
+                last_quantity_state = await self.page.evaluate(quantity_script)
+                if (
+                    isinstance(last_quantity_state, dict)
+                    and last_quantity_state.get("done") is True
+                    and last_quantity_state.get("current") == plan["quantity"]
+                ):
+                    break
+                await self.page.sleep(0.15)
+            else:
+                raise RuntimeError(
+                    "Ticket Plus 無法將票券張數調整為 "
+                    f"{plan['quantity']}：{last_quantity_state}"
+                )
+
+        continue_script = r"""
+        (() => {
+          window.ticketPlusContinueTickets = window.ticketPlusContinueTickets || (() => {
+            const visible = element => {
+              const style = getComputedStyle(element);
+              return style.display !== 'none' && style.visibility !== 'hidden';
+            };
+            const next = [...document.querySelectorAll('button, a')].find(element => {
+              const text = (element.innerText || '').replace(/\s+/g, ' ').trim();
+              const disabled = element.disabled || element.getAttribute('aria-disabled') === 'true' ||
+                /disabled/.test(element.className || '');
+              return visible(element) && !disabled && /下一步|確認張數|立即訂購|建立訂單/.test(text);
+            });
+            if (!next) return false;
+            next.click();
+            return true;
+          });
+          return window.ticketPlusContinueTickets();
+        })()
+        """
+        for _ in range(20):
+            await self.page.sleep(0.2)
+            if await self.page.evaluate(continue_script) is True:
+                return
+        diagnostic_script = rf"""
+        (() => {{
+          window.ticketPlusSelectionDiagnostic = window.ticketPlusSelectionDiagnostic || (key => {{
+            const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+            const row = [...document.querySelectorAll('[data-ticket-bot-key]')]
+              .find(element => element.dataset.ticketBotKey === key);
+            const controls = row ? [...row.querySelectorAll(
+              'input, button, select, [role="radio"], [role="option"], [role="checkbox"], [aria-selected]'
+            )].map(element => ({{
+              tag: element.tagName,
+              type: element.getAttribute('type') || '',
+              class_name: clean(element.className && (element.className.baseVal || element.className)),
+              text: clean(element.innerText || element.getAttribute('aria-label')),
+              disabled: Boolean(element.disabled) || element.getAttribute('aria-disabled') === 'true',
+              checked: Boolean(element.checked),
+              aria_checked: element.getAttribute('aria-checked'),
+              aria_selected: element.getAttribute('aria-selected')
+            }})) : [];
+            const nextButtons = [...document.querySelectorAll('button, a')]
+              .filter(element => /下一步|確認張數|立即訂購|建立訂單/.test(clean(element.innerText)))
+              .map(element => ({{
+                text: clean(element.innerText),
+                disabled: Boolean(element.disabled) || element.getAttribute('aria-disabled') === 'true' ||
+                  /disabled/.test(clean(element.className)),
+                class_name: clean(element.className)
+              }}));
+            return {{
+              selected_row_text: clean(row && row.innerText),
+              selected_row_class: clean(row && row.className),
+              selected_row_html: String(row && row.outerHTML || '').slice(0, 12000),
+              controls,
+              next_buttons: nextButtons
+            }};
+          }});
+          return window.ticketPlusSelectionDiagnostic({key_json});
+        }})()
+        """
+        diagnostic = await self.page.evaluate(diagnostic_script)
+        logger.error(
+            "Ticket Plus 票區展開後 DOM 診斷：%s",
+            json.dumps(diagnostic, ensure_ascii=False),
+        )
+        raise RuntimeError("Ticket Plus 已選擇票區，但『下一步』按鈕仍未啟用")
+
+    async def _select_seats(self, seats: list[dict]) -> None:
+        if self.page is None:
+            raise RuntimeError("Ticket Plus 頁面尚未建立")
+        keys = [seat["key"] for seat in seats]
+        payload = json.dumps(keys, ensure_ascii=False)
+        script = f"""
+        (() => {{
+          window.ticketPlusSelectSeats = window.ticketPlusSelectSeats || (keys => {{
+            const nodes = keys.map(key => [...document.querySelectorAll('[data-ticket-bot-key]')]
+              .find(element => element.dataset.ticketBotKey === key));
+            if (nodes.some(node => !node)) return false;
+            nodes.forEach(node => node.click());
+            const next = [...document.querySelectorAll('button, a')].find(el =>
+              /確認座位|下一步|建立訂單/.test((el.innerText || '').trim()));
+            if (next) next.click();
+            return true;
+          }});
+          return window.ticketPlusSelectSeats({payload});
+        }})()
+        """
+        if await self.page.evaluate(script) is not True:
+            raise RuntimeError(f"Ticket Plus 無法選擇座位: {', '.join(keys)}")
+
+    async def run(self) -> bool:
+        try:
+            page = await self._ensure_page()
+            await page.goto(self.event.url)
+            self._selected_session_key = None
+            state_steps = 0
+            queue_steps = 0
+            queue_logged = False
+            while state_steps < MAX_STATE_STEPS:
+                snapshot = await self._snapshot()
+                if snapshot.get("verification_required"):
+                    state_steps += 1
+                    logger.warning("Ticket Plus 等待使用者完成人工驗證，程式不會嘗試繞過。")
+                    await page.sleep(STATE_POLL_SECONDS)
+                    continue
+
+                state = detect_page_state(snapshot)
+                if state == "transient_error":
+                    self.last_error = "Ticket Plus 排隊或送出訂單時發生錯誤：您的操作好像出了一點問題，請稍後再試。"
+                    logger.error(self.last_error)
+                    return False
+                if state == "login_required":
+                    self.last_error = "Ticket Plus 尚未登入；請先執行 login --platform ticketplus。"
+                    logger.error(self.last_error)
+                    return False
+                if state == "queue":
+                    queue_steps += 1
+                    if not queue_logged:
+                        logger.info("Ticket Plus 已進入官方排隊頁面，等待網站自動放行。")
+                        queue_logged = True
+                    if queue_steps >= MAX_QUEUE_STEPS:
+                        self.last_error = "Ticket Plus 官方排隊等待超過 10 分鐘。"
+                        logger.error(self.last_error)
+                        return False
+                    await page.sleep(STATE_POLL_SECONDS)
+                    continue
+                state_steps += 1
+                if state == "sale_not_started":
+                    await page.sleep(STATE_POLL_SECONDS)
+                    continue
+                if state == "session_select":
+                    if self._selected_session_key is not None:
+                        await page.sleep(STATE_POLL_SECONDS)
+                        continue
+                    logger.info(
+                        "Ticket Plus 場次篩選資料：date_keyword=%r sessions=%s",
+                        self.event.date_keyword,
+                        json.dumps(snapshot["sessions"], ensure_ascii=False),
+                    )
+                    session = select_session(self.event, snapshot["sessions"])
+                    await self._select_session(session["key"])
+                    self._selected_session_key = session["key"]
+                    logger.info("Ticket Plus 已送出場次選擇，等待訂票頁面載入。")
+                    await page.sleep(STATE_POLL_SECONDS)
+                    continue
+                if state == "ticket_select":
+                    try:
+                        self._ticket_plan = build_ticket_plan(self.event, snapshot["ticket_units"])
+                    except ValueError as error:
+                        self.last_error = str(error)
+                        await page.sleep(STATE_POLL_SECONDS)
+                        continue
+                    await self._select_ticket(self._ticket_plan)
+                    await page.sleep(STATE_POLL_SECONDS)
+                    continue
+                if state == "seat_map":
+                    if not snapshot.get("seats"):
+                        self.last_error = "Ticket Plus 座位圖只有 Canvas 或沒有可讀座位資料，已安全停止。"
+                        logger.error(self.last_error)
+                        return False
+                    selected = select_adjacent_seats(self.event, snapshot["seats"])
+                    await self._select_seats(selected)
+                    await page.sleep(STATE_POLL_SECONDS)
+                    continue
+                if state in {"order_review", "payment_boundary"}:
+                    if self._ticket_plan is None:
+                        self.last_error = "Ticket Plus 到達訂單頁，但沒有可供核對的選票計畫。"
+                        logger.error(self.last_error)
+                        return False
+                    errors = validate_order_review(self.event, self._ticket_plan, snapshot)
+                    if errors:
+                        self.last_error = "；".join(errors)
+                        logger.error("Ticket Plus 訂單核對失敗：%s", self.last_error)
+                        return False
+                    self.last_success_info = (
+                        f"票種: {self._ticket_plan['ticket_name']}；"
+                        f"張數: {self._ticket_plan['quantity']}；"
+                        f"總額: {snapshot.get('total')}；已停在付款前。"
+                    )
+                    logger.info("Ticket Plus 訂單建立成功，%s", self.last_success_info)
+                    return True
+
+                if not self.last_error:
+                    logger.info("Ticket Plus 頁面仍在載入，等待 Vue 完成顯示活動內容。")
+                page_url = str(snapshot.get("page_url", ""))
+                if "/order/" in urlparse(page_url).path:
+                    diagnostic = json.dumps(
+                        {
+                            "page_url": page_url,
+                            "title": snapshot.get("title"),
+                            "body_excerpt": snapshot.get("body_excerpt"),
+                            "price_candidates": snapshot.get("price_candidates", []),
+                            "sessions": snapshot.get("sessions", []),
+                            "ticket_units": snapshot.get("ticket_units", []),
+                        },
+                        ensure_ascii=False,
+                    )
+                    if diagnostic != self._last_snapshot_diagnostic:
+                        logger.info("Ticket Plus 訂票頁 DOM 診斷：%s", diagnostic)
+                        self._last_snapshot_diagnostic = diagnostic
+                self.last_error = "Ticket Plus 頁面仍在載入或目前狀態無法辨識。"
+                await page.sleep(STATE_POLL_SECONDS)
+                continue
+
+            self.last_error = "Ticket Plus 等待頁面狀態逾時。"
+            logger.error(self.last_error)
+            return False
+        except Exception as error:
+            self.last_error = str(error)
+            logger.exception("Ticket Plus 執行失敗")
+            return False
+
+    async def watch(self, interval: float = 5.0) -> bool:
+        while True:
+            if await self.run():
+                return True
+            if self.last_error and any(
+                marker in self.last_error
+                for marker in ("尚未登入", "Canvas", "無法辨識", "訂單核對", "沒有可供核對")
+            ):
+                return False
+            if self.page is not None:
+                await self.page.sleep(interval)
+
+    async def close(self) -> None:
+        await self.engine.close()

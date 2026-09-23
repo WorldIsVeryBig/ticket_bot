@@ -1,0 +1,61 @@
+# Copy to config.aws-tokyo.yaml before use.
+# Replace proxy_server, cookie_file, and event filters with your own values.
+
+deployment:
+  profile: aws_tokyo
+
+events:
+  - name: "Sample Event"
+    platform: tixcraft
+    url: "https://tixcraft.com/activity/game/your_event"
+    ticket_count: 1
+    date_keyword: ""
+    area_keyword: ""
+    sale_time: ""
+    presale_code: ""
+
+browser:
+  engine: playwright
+  headless: true
+  user_data_dir: "./chrome_profile_node_1"
+  pre_warm: true
+  lang: "zh-TW"
+  executable_path: "/usr/bin/chromium"
+  api_mode: "full"
+  turbo_mode: true
+
+captcha:
+  engine: ddddocr
+  beta_model: true
+  char_ranges: 0
+  confidence_threshold: 0.6
+  max_attempts: 5
+  preprocess: false
+  custom_model_path: "model/captcha_model.onnx"
+  custom_charset_path: "model/charset.json"
+  collect_dir: ""
+
+notifications:
+  telegram:
+    enabled: false
+  discord:
+    enabled: false
+
+proxy:
+  enabled: false
+  rotate: true
+  servers: []
+
+trace:
+  enabled: true
+  log_path: "./logs/tixcraft_trace_aws_tokyo.jsonl"
+
+sessions:
+  - name: "tokyo_a"
+    user_data_dir: "./chrome_profile_node_1"
+    proxy_server: "http://username:password@proxy-host:10002"
+    cookie_file: "/opt/ticket-bot/tixcraft_cookies.json"
+  - name: "tokyo_b"
+    user_data_dir: "./chrome_profile_node_2"
+    proxy_server: "http://username:password@proxy-host:10003"
+    cookie_file: "/opt/ticket-bot/tixcraft_cookies.json"

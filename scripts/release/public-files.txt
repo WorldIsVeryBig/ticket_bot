@@ -1,0 +1,26 @@
+# Top-level files
+.dockerignore
+.env.example
+.gitignore
+Dockerfile
+LICENSE
+OPEN_SOURCE_RELEASE.md
+README.md
+VERSIONING.md
+config.aws-tokyo.example.yaml
+config.cloud.example.yaml
+config.local.example.yaml
+config.yaml.example
+docker-compose.example.yml
+pyproject.toml
+
+# Source and tests
+src
+tests
+
+# Public scripts
+scripts/README.md
+scripts/debug
+scripts/diagnostics
+scripts/release
+scripts/train

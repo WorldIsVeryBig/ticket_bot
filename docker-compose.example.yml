@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  ticket-bot:
+    build: .
+    image: ticket-bot:local
+    container_name: ticket-bot
+    restart: unless-stopped
+    command: ["python", "-m", "ticket_bot", "run"]
+    environment:
+      - BROWSER_HEADLESS=true
+      - BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
+      - BROWSER_ENGINE=playwright
+      - BROWSER_API_MODE=full
+    env_file:
+      - .env
+    volumes:
+      - ./config.yaml:/opt/ticket-bot/config.yaml:ro
+      - ./tixcraft_cookies.json:/opt/ticket-bot/tixcraft_cookies.json:ro
+      - ./chrome_profile:/opt/ticket-bot/chrome_profile
+      - ./model:/opt/ticket-bot/model:ro
+      - ./logs:/opt/ticket-bot/logs

@@ -1,0 +1,88 @@
+
+# 環境變數（含 API tokens、密鑰）
+.env
+.env.local
+.env.*.local
+
+# 本機工具設定
+.claude/settings.local.json
+
+# 瀏覽器登入狀態（含 cookies、session）
+chrome_profile/
+chrome_profile_*/
+tixcraft_cookies.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+dist/
+build/
+*.egg-info/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cache
+.pytest_cache/
+
+# 執行期間 log / debug 產物
+*.log
+logs/
+*_debug.html
+*_debug.png
+debug_*.png
+order_sittight_debug.html
+order_screenshot.png
+success_order.png
+current_test_*.png
+debug_html/
+debug_output/
+live_debug/
+debug_failures/
+error_analysis/
+
+# 驗證碼收集 / 執行時樣本
+captcha_samples/
+captcha_training_data/samples/
+captcha_training_data/tixcraft_samples/
+model/*.pth
+
+# 設定檔（含個人路徑與 chat_id）
+config.yaml
+config.local.yaml
+config.cloud.yaml
+config.aws-tokyo.yaml
+config.tg-bot.yaml
+config.*.local.yaml
+
+# 本機臨時整理區
+scratch/
+
+# 其他瀏覽器 Profile
+patchright_profile_capture/
+patchright_profile_*/
+
+# 非標準名稱的虛擬環境
+venv/
+venv-*/
+
+# 本機診斷與備份檔
+ticket-bot-current-changes.patch
+ticket-bot-diagnostics.txt
+ticket-bot-git-status.txt
+
+# 本機打包檔
+ticket-bot-source-review-*.zip
+ticket-lab-recording.zip
+
+# 實驗性 Rust 版本，不提供給學生時排除
+ticket-bot2/

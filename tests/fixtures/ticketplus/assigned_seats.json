@@ -1,0 +1,9 @@
+{
+  "seats": [
+    {"key": "a-8", "area": "A區", "row": "3", "seat_number": "8", "price": 3200, "available": true, "selectable": true},
+    {"key": "a-9", "area": "A區", "row": "3", "seat_number": "9", "price": 3200, "available": true, "selectable": true},
+    {"key": "a-11", "area": "A區", "row": "3", "seat_number": "11", "price": 3200, "available": true, "selectable": true},
+    {"key": "b-1", "area": "B區", "row": "1", "seat_number": "1", "price": 2500, "available": true, "selectable": true},
+    {"key": "b-2", "area": "B區", "row": "1", "seat_number": "2", "price": 2500, "available": true, "selectable": true}
+  ]
+}

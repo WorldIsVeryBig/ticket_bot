@@ -1,0 +1,79 @@
+events:
+  - name: "活動名稱"
+    platform: tixcraft
+    url: "https://tixcraft.com/activity/game/your_event"
+    ticket_count: 2
+    date_keyword: ""               # 場次日期篩選（留空 = 第一個可用）
+    area_keyword: ""               # 區域篩選（留空 = 第一個可用）
+    sale_time: ""                  # 倒數模式用，ISO 8601 格式，如 "2026-04-15T12:00:00+08:00"
+    presale_code: ""
+
+  # Ticket Plus 遠大售票範例：依序嘗試 S區、一般區，單張不超過 4000 元。
+  # 不使用時請保留註解；要啟用時移除以下每行開頭的「#」。
+  # - name: "Ticket Plus"
+  #   platform: ticketplus
+  #   url: "https://ticketplus.com.tw/activity/6d2868aeec40f3676950edc8fb70a1f4"
+  #   ticket_count: 2
+  #   date_keyword: "2026-11-22"
+  #   area_keyword: ""            # 舊版單一票區欄位仍可使用
+  #   area_keywords:               # 依順序嘗試；有設定時優先於 area_keyword
+  #     - "S區"
+  #     - "一般區"
+  #   max_price: 4000              # 單張最高票價；留空代表不限制
+  #   sale_time: ""
+  #   presale_code: ""
+
+browser:
+  engine: nodriver                 # nodriver（推薦）或 playwright
+  headless: false
+  user_data_dir: "./chrome_profile"
+  pre_warm: true
+  lang: "zh-TW"
+  executable_path: ""              # 留空自動偵測，或指定 Chrome 路徑
+  api_mode: "off"                  # off=純瀏覽器 / checkout=結帳API / full=全流程API
+
+captcha:
+  engine: ddddocr
+  beta_model: true
+  char_ranges: 0                   # 0 = 不限制, 1 = 小寫 a-z（tixcraft 用 0 較準）
+  confidence_threshold: 0.6
+  max_attempts: 5
+  preprocess: false                # tixcraft captcha 不需前處理
+  custom_model_path: "model/captcha_model.onnx" # 自訓練 ONNX 模型路徑（留空用預設模型）
+  custom_charset_path: "model/charset.json"      # 自訓練模型字元集路徑（推薦 json；txt 也支援）
+  collect_dir: ""                  # 驗證碼收集目錄（留空不收集，填路徑啟用，如 "./captcha_samples"）
+
+notifications:
+  telegram:
+    enabled: false
+    chat_id: ""                    # 從 .env 讀取，或填在這裡
+  discord:
+    enabled: false
+
+proxy:
+  enabled: false
+  rotate: true
+  servers: []
+  # - "http://user:pass@proxy-host:port"
+
+trace:
+  enabled: false
+  log_path: "./logs/tixcraft_trace.jsonl" # 記錄 cf-ray / redirect / set-cookie 名稱摘要
+
+# Gemma 4 AI 助手（本地推理）
+gemma:
+  enabled: false                   # 啟用 Gemma 4 NLU + RL 元策略
+  backend: ollama                  # 推理後端：ollama（本地）
+  model: "gemma4:e4b"              # Ollama 模型名（需先 ollama pull）
+  ollama_url: "http://localhost:11434"
+  timeout: 30.0                    # 推理超時秒數
+  rl_advisor: true                 # 啟用 RL 元策略顧問（/advice 指令）
+
+# 多帳號並行搶票（可選）
+# sessions:
+#   - name: "帳號A"
+#     user_data_dir: "./chrome_profile_a"
+#     proxy_server: ""
+#   - name: "帳號B"
+#     user_data_dir: "./chrome_profile_b"
+#     proxy_server: ""

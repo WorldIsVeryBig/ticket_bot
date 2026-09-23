@@ -30,7 +30,7 @@
 ### 1. 下載專案
 
 ```bash
-git clone <你的私人 Repository URL>
+git clone git@github.com:WorldIsVeryBig/ticket_bot.git
 cd ticket-bot-public
 ```
 

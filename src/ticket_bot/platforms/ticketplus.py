@@ -416,36 +416,141 @@ class TicketPlusBot:
             await self._snapshot()
 
         # 3. 調整張數 (+)
+        # 必須鎖定目前選中的票區，避免點到其他票區或畫面外的錯誤按鈕。
         if plan.get("selection_mode") == "area_panel" or expanded_panel:
-            for _ in range(30):
-                # 只定位目前展開票區內可見的加號，避免抓到其他隱藏票區
-                plus_btn = raw_page.locator(
-                    ".count-button:visible button:has(.mdi-plus)"
-                ).first
+            adjust_result = await raw_page.evaluate(
+                """
+                async ({ key, targetQty }) => {
+                  const sleep = ms =>
+                    new Promise(resolve => setTimeout(resolve, ms));
 
-                if await plus_btn.is_visible() and await plus_btn.is_enabled():
-                    # 檢查當前數量
-                    get_qty_script = """
-                    (() => {
-                      const counters = [...document.querySelectorAll('.count-button')].filter(el => el.offsetParent !== null || el.getClientRects().length > 0);
-                      if (counters.length === 0) return 0;
-                      const numNode = [...counters[0].children].find(el => el.tagName !== 'BUTTON' && /^\\d+$/.test(el.innerText.trim()));
-                      return numNode ? parseInt(numNode.innerText.trim(), 10) : 0;
-                    })()
-                    """
-                    current_qty = await self.page.evaluate(get_qty_script)
-                    if current_qty >= quantity:
-                        break
+                  const findRow = () =>
+                    [...document.querySelectorAll('[data-ticket-bot-key]')]
+                      .find(element => element.dataset.ticketBotKey === key);
 
-                    await plus_btn.click(force=True)
-                    await self.page.sleep(0.25)
-                else:
-                    await self.page.sleep(0.2)
+                  const findVisibleCounter = row =>
+                    [...row.querySelectorAll('.count-button')]
+                      .find(element =>
+                        element.offsetParent !== null ||
+                        element.getClientRects().length > 0
+                      );
+
+                  const readQuantity = counter => {
+                    if (!counter) return null;
+
+                    const numberNode = [...counter.children].find(element =>
+                      element.tagName !== 'BUTTON' &&
+                      /^\\s*\\d+\\s*$/.test(element.textContent || '')
+                    );
+
+                    return numberNode
+                      ? Number.parseInt(numberNode.textContent.trim(), 10)
+                      : null;
+                  };
+
+                  let row = findRow();
+
+                  if (!row) {
+                    return {
+                      ok: false,
+                      reason: 'selected-row-not-found',
+                      quantity: null
+                    };
+                  }
+
+                  row.scrollIntoView({
+                    behavior: 'auto',
+                    block: 'center',
+                    inline: 'nearest'
+                  });
+
+                  await sleep(200);
+
+                  for (let attempt = 0; attempt < targetQty + 5; attempt++) {
+                    // Vue 更新 DOM 後重新取得票區，避免使用失效節點。
+                    row = findRow();
+
+                    if (!row) {
+                      return {
+                        ok: false,
+                        reason: 'selected-row-disappeared',
+                        quantity: null
+                      };
+                    }
+
+                    const counter = findVisibleCounter(row);
+                    const currentQty = readQuantity(counter);
+
+                    if (currentQty !== null && currentQty >= targetQty) {
+                      return {
+                        ok: true,
+                        reason: 'target-reached',
+                        quantity: currentQty
+                      };
+                    }
+
+                    if (!counter) {
+                      await sleep(200);
+                      continue;
+                    }
+
+                    const plusButton = [...counter.querySelectorAll('button')]
+                      .find(button =>
+                        button.querySelector('.mdi-plus') &&
+                        !button.disabled &&
+                        button.getAttribute('aria-disabled') !== 'true'
+                      );
+
+                    if (!plusButton) {
+                      return {
+                        ok: false,
+                        reason: 'plus-button-not-found',
+                        quantity: currentQty
+                      };
+                    }
+
+                    plusButton.scrollIntoView({
+                      behavior: 'auto',
+                      block: 'center',
+                      inline: 'nearest'
+                    });
+
+                    // 使用 DOM click，避免畫面外或浮動按鈕遮住時點擊失敗。
+                    plusButton.click();
+                    await sleep(350);
+                  }
+
+                  row = findRow();
+                  const counter = row ? findVisibleCounter(row) : null;
+                  const finalQty = readQuantity(counter);
+
+                  return {
+                    ok: finalQty !== null && finalQty >= targetQty,
+                    reason: 'attempts-exhausted',
+                    quantity: finalQty
+                  };
+                }
+                """,
+                {
+                    "key": ticket_key,
+                    "targetQty": quantity,
+                },
+            )
+
+            logger.info(
+                "Ticket Plus 張數調整結果：%s",
+                json.dumps(adjust_result, ensure_ascii=False),
+            )
 
         elif plan.get("selection_mode") == "area":
-            radio = raw_page.locator(f'[data-ticket-bot-key="{ticket_key}"] input[type="radio"], [role="radio"]').first
+            radio = raw_page.locator(
+                f'[data-ticket-bot-key="{ticket_key}"] input[type="radio"], '
+                '[role="radio"]'
+            ).first
+
             if await radio.is_visible():
-                await radio.click(force=True)
+                await radio.scroll_into_view_if_needed()
+                await radio.click()
 
         # 4. 點擊下一步按鈕
         for _ in range(25):

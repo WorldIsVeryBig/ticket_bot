@@ -33,7 +33,7 @@ from ticket_bot.platforms.ticketplus_parser import (
 logger = logging.getLogger(__name__)
 
 TICKETPLUS_HOME_URL = "https://ticketplus.com.tw/"
-MAX_STATE_STEPS = 80
+MAX_STATE_STEPS = 240
 MAX_QUEUE_STEPS = 2400
 STATE_POLL_SECONDS = 0.25
 LAB_QUEUE_TIMEOUT_SECONDS = 600
@@ -193,13 +193,28 @@ _SNAPSHOT_JS = r"""
         (element.parentElement.className.baseVal || element.parentElement.className)),
       parent_text: clean(element.parentElement && element.parentElement.innerText).slice(0, 300)
     }));
-  const orderAreas = [...document.querySelectorAll('.v-expansion-panel, [class*="expansion-panel"], .seats-area')]
-    .filter(visible)
-    .map((element, index) => {
-      const header = element.querySelector('button.v-expansion-panel-header');
+  const orderAreaPanels = [...document.querySelectorAll('.v-expansion-panel, [class~="expansion-panel"]')];
+  orderAreaPanels.forEach((element, index) => keyFor(element, 'ticket-area', index));
+  const orderAreas = orderAreaPanels.map((element, index) => {
+      const header = element.querySelector(':scope > button.v-expansion-panel-header');
+      const nestedPanel = element.querySelector(
+        ':scope > .v-expansion-panel-content .v-expansion-panel, :scope > [class~="expansion-panel-content"] [class~="expansion-panel"]'
+      );
+      const ancestorKeys = [];
+      let parent = element.parentElement && element.parentElement.closest(
+        '.v-expansion-panel, [class~="expansion-panel"]'
+      );
+      while (parent) {
+        ancestorKeys.unshift(parent.dataset.ticketBotKey || '');
+        parent = parent.parentElement && parent.parentElement.closest(
+          '.v-expansion-panel, [class~="expansion-panel"]'
+        );
+      }
       return {
         key: keyFor(element, 'ticket-area', index),
-        text: clean(element.innerText),
+        text: clean(element.innerText || element.textContent),
+        is_leaf: !nestedPanel,
+        ancestor_keys: ancestorKeys.filter(Boolean),
         disabled: !header || header.disabled || header.getAttribute('aria-disabled') === 'true' ||
           /disabled/.test(clean(header.className))
       };
@@ -320,175 +335,151 @@ class TicketPlusBot:
     async def _select_ticket(self, plan: dict) -> None:
         if self.page is None:
             raise RuntimeError("Ticket Plus 頁面尚未建立")
-        payload = json.dumps(plan, ensure_ascii=False)
-        key_json = json.dumps(plan["ticket_key"], ensure_ascii=False)
-        script = rf"""
+
+        raw_page = getattr(self.page, "_page", None) or getattr(self.page, "page", None) or self.page
+        ticket_key = plan.get("ticket_key", "")
+        quantity = plan.get("quantity", 1)
+        key_json = json.dumps(ticket_key, ensure_ascii=False)
+
+        # 1. 用 JS 分析 DOM 階層，標記出所有需要由外而內展開的 Header 按鈕
+        get_headers_script = rf"""
         (() => {{
-          window.ticketPlusSelectTickets = window.ticketPlusSelectTickets || (plan => {{
-            const row = [...document.querySelectorAll('[data-ticket-bot-key]')]
-              .find(element => element.dataset.ticketBotKey === plan.ticket_key);
-            if (!row) return false;
-            const radio = row.matches('input[type="radio"], [role="radio"]') ? row :
-              row.querySelector('input[type="radio"], [role="radio"]');
-            if (plan.selection_mode === 'area_panel') {{
-              const header = row.querySelector('button.v-expansion-panel-header');
-              if (!header || header.disabled || header.getAttribute('aria-disabled') === 'true') return false;
-              header.click();
-              return true;
+          const key = {key_json};
+          const target = document.querySelector(`[data-ticket-bot-key="${{key}}"]`);
+          if (!target) return [];
+
+          const chain = [];
+          let curr = target;
+
+          // 由下往上收集所有父級 v-expansion-panel
+          while (curr) {{
+            if (curr.classList && curr.classList.contains('v-expansion-panel')) {{
+              chain.unshift(curr); // 放在開頭，確保「由外而內」
             }}
-            if (plan.selection_mode === 'area') {{
-              if (!radio || radio.disabled || radio.getAttribute('aria-disabled') === 'true') return false;
-              const target = radio.closest('label') || radio;
-              target.click();
-              return true;
+            curr = curr.parentElement;
+          }}
+
+          // 檢查目標內部是否還包含子 Panel (例如選擇了 3880 區外層，自動選擇裡面的 B1區)
+          const childPanels = [...target.querySelectorAll('.v-expansion-panel')];
+          if (childPanels.length > 0) {{
+            const validChild = childPanels.find(p => {{
+              const txt = p.innerText || '';
+              return (txt.includes('熱賣中') || txt.includes('剩餘')) && !p.querySelector('.v-chip--disabled');
+            }}) || childPanels[0];
+            chain.push(validChild);
+          }}
+
+          const headersToClick = [];
+          for (const panel of chain) {{
+            if (panel.getAttribute('aria-expanded') !== 'true') {{
+              const btn = panel.querySelector('button.v-expansion-panel-header, .v-expansion-panel-header');
+              if (btn) {{
+                if (!btn.dataset.ticketBotHeaderId) {{
+                  btn.dataset.ticketBotHeaderId = 'hdr-' + Math.random().toString(36).substring(2, 9);
+                }}
+                headersToClick.push(btn.dataset.ticketBotHeaderId);
+              }}
             }}
-            const select = row.querySelector('select');
-            const input = row.querySelector('input[type="number"], input[type="text"]');
-            if (select) {{
-              select.value = String(plan.quantity);
-              select.dispatchEvent(new Event('change', {{bubbles: true}}));
-            }} else if (input) {{
-              const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-              setter.call(input, String(plan.quantity));
-              input.dispatchEvent(new Event('input', {{bubbles: true}}));
-              input.dispatchEvent(new Event('change', {{bubbles: true}}));
-            }} else {{
-              const plus = [...row.querySelectorAll('button, a')]
-                .find(el => /\+|增加|加/.test((el.innerText || el.getAttribute('aria-label') || '').trim()));
-              if (!plus) return false;
-              for (let index = 0; index < plan.quantity; index += 1) plus.click();
-            }}
-            return true;
-          }});
-          return window.ticketPlusSelectTickets({payload});
+          }}
+          return headersToClick;
         }})()
         """
-        if await self.page.evaluate(script) is not True:
-            raise RuntimeError(f"Ticket Plus 無法選擇票種: {plan['ticket_name']}")
 
-        if plan.get("selection_mode") == "area_panel":
-            # 等待 Vuetify 面板展開動畫完成
+        # 2. 每次只展開一層。
+        # 外層展開後 Vue 會重新建立內層 DOM，所以必須重新取得 snapshot 與 header。
+        expanded_panel = False
+
+        for _ in range(8):
+            header_ids = await self.page.evaluate(get_headers_script)
+
+            # 外層與目標票區都已展開
+            if not header_ids:
+                break
+
+            # 每輪只點目前最外層尚未展開的 header
+            hdr_id = header_ids[0]
+            hdr_locator = raw_page.locator(
+                f'[data-ticket-bot-header-id="{hdr_id}"]'
+            ).first
+
+            if not await hdr_locator.is_visible():
+                # Vue 可能剛完成重新渲染，重新建立 data-ticket-bot-key
+                await self._snapshot()
+                await self.page.sleep(0.2)
+                continue
+
+            await hdr_locator.click(force=True)
+            expanded_panel = True
+
+            # 等待 Vuetify 展開動畫與 Vue 重新建立內層 DOM
             await self.page.sleep(0.5)
+            await self._snapshot()
 
-            quantity_payload = json.dumps(
-                {
-                    "ticket_key": plan["ticket_key"],
-                    "quantity": plan["quantity"],
-                },
-                ensure_ascii=False,
-            )
-            quantity_script = rf"""
-            (() => {{
-              window.ticketPlusAdjustAreaQuantity = window.ticketPlusAdjustAreaQuantity || (plan => {{
-                const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
-                const row = [...document.querySelectorAll('[data-ticket-bot-key]')]
-                  .find(element => element.dataset.ticketBotKey === plan.ticket_key);
-                const counter = row && row.querySelector('.count-button');
-                if (!counter) return {{ready: false, current: null, done: false}};
-                const numberNode = [...counter.children].find(element =>
-                  element.tagName !== 'BUTTON' && /^\d+$/.test(clean(element.innerText)));
-                if (!numberNode) return {{ready: false, current: null, done: false}};
-                const current = Number(clean(numberNode.innerText));
-                if (current === plan.quantity) {{
-                  return {{ready: true, current, done: true, clicked: false}};
-                }}
-                const iconClass = current < plan.quantity ? 'mdi-plus' : 'mdi-minus';
-                const button = [...counter.querySelectorAll('button')].find(element =>
-                  element.querySelector(`i.${{iconClass}}`));
-                const disabled = !button || button.disabled ||
-                  button.getAttribute('aria-disabled') === 'true' ||
-                  /disabled/.test(clean(button && button.className));
-                if (disabled) {{
-                  return {{ready: true, current, done: false, clicked: false}};
-                }}
-                button.click();
-                return {{ready: true, current, done: false, clicked: true}};
-              }});
-              return window.ticketPlusAdjustAreaQuantity({quantity_payload});
-            }})()
-            """
-            last_quantity_state: object = None
-            for _ in range(50):  # 增加重試次數至 50 次 (約 7.5 秒)
-                last_quantity_state = await self.page.evaluate(quantity_script)
-                if (
-                    isinstance(last_quantity_state, dict)
-                    and last_quantity_state.get("done") is True
-                    and last_quantity_state.get("current") == plan["quantity"]
-                ):
-                    break
-                await self.page.sleep(0.15)
-            else:
-                # 就算張數調整沒回報 done，也不要直接拋出 Error 關閉瀏覽器，嘗試繼續進行下一步
-                logger.warning(
-                    "Ticket Plus 張數調整狀態未完全確認，嘗試繼續進行下一步: %s",
-                    last_quantity_state,
-                )
-        # 取得底層真實 Playwright Page 物件 (_page)
-        raw_page = getattr(self.page, "_page", None) or getattr(self.page, "page", None) or self.page
-        
-        for _ in range(20):
-            await self.page.sleep(0.2)
-            try:
-                if hasattr(raw_page, "locator"):
-                    # 使用 Playwright 原生發送實體滑鼠點擊
-                    next_btn = raw_page.locator("button.nextBtn, .nextBtn").first
-                    if await next_btn.is_visible() and await next_btn.is_enabled():
-                        await next_btn.click(force=True)
-                        return
+        # 3. 調整張數 (+)
+        if plan.get("selection_mode") == "area_panel" or expanded_panel:
+            for _ in range(30):
+                # 只定位目前展開票區內可見的加號，避免抓到其他隱藏票區
+                plus_btn = raw_page.locator(
+                    ".count-button:visible button:has(.mdi-plus)"
+                ).first
+
+                if await plus_btn.is_visible() and await plus_btn.is_enabled():
+                    # 檢查當前數量
+                    get_qty_script = """
+                    (() => {
+                      const counters = [...document.querySelectorAll('.count-button')].filter(el => el.offsetParent !== null || el.getClientRects().length > 0);
+                      if (counters.length === 0) return 0;
+                      const numNode = [...counters[0].children].find(el => el.tagName !== 'BUTTON' && /^\\d+$/.test(el.innerText.trim()));
+                      return numNode ? parseInt(numNode.innerText.trim(), 10) : 0;
+                    })()
+                    """
+                    current_qty = await self.page.evaluate(get_qty_script)
+                    if current_qty >= quantity:
+                        break
+
+                    await plus_btn.click(force=True)
+                    await self.page.sleep(0.25)
                 else:
-                    # 備用 JS 點擊
-                    clicked = await self.page.evaluate("""
-                        (() => {
-                            const btn = document.querySelector('button.nextBtn, .nextBtn');
-                            if (btn && !btn.disabled) { btn.click(); return true; }
-                            return false;
-                        })()
-                    """)
-                    if clicked:
-                        return
-            except Exception as exc:
-                logger.debug("等待點擊下一步按鈕中: %s", exc)
+                    await self.page.sleep(0.2)
 
+        elif plan.get("selection_mode") == "area":
+            radio = raw_page.locator(f'[data-ticket-bot-key="{ticket_key}"] input[type="radio"], [role="radio"]').first
+            if await radio.is_visible():
+                await radio.click(force=True)
+
+        # 4. 點擊下一步按鈕
+        for _ in range(25):
+            await self.page.sleep(0.2)
+            next_btn = raw_page.locator("button.nextBtn, .nextBtn").first
+            if await next_btn.is_visible() and await next_btn.is_enabled():
+                await next_btn.click(force=True)
+                return
+
+        # 5. 診斷輸出 (若依然未成功啟用下一步)
         diagnostic_script = rf"""
         (() => {{
-          window.ticketPlusSelectionDiagnostic = window.ticketPlusSelectionDiagnostic || (key => {{
-            const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
-            const row = [...document.querySelectorAll('[data-ticket-bot-key]')]
-              .find(element => element.dataset.ticketBotKey === key);
-            const controls = row ? [...row.querySelectorAll(
-              'input, button, select, [role="radio"], [role="option"], [role="checkbox"], [aria-selected]'
-            )].map(element => ({{
-              tag: element.tagName,
-              type: element.getAttribute('type') || '',
-              class_name: clean(element.className && (element.className.baseVal || element.className)),
-              text: clean(element.innerText || element.getAttribute('aria-label')),
-              disabled: Boolean(element.disabled) || element.getAttribute('aria-disabled') === 'true',
-              checked: Boolean(element.checked),
-              aria_checked: element.getAttribute('aria-checked'),
-              aria_selected: element.getAttribute('aria-selected')
-            }})) : [];
-            const nextButtons = [...document.querySelectorAll('button, a')]
-              .filter(element => /下一步|確認張數|立即訂購|建立訂單/.test(clean(element.innerText)))
-              .map(element => ({{
-                text: clean(element.innerText),
-                disabled: Boolean(element.disabled) || element.getAttribute('aria-disabled') === 'true' ||
-                  /disabled/.test(clean(element.className)),
-                class_name: clean(element.className)
-              }}));
-            return {{
-              selected_row_text: clean(row && row.innerText),
-              selected_row_class: clean(row && row.className),
-              selected_row_html: String(row && row.outerHTML || '').slice(0, 12000),
-              controls,
-              next_buttons: nextButtons
-            }};
-          }});
-          return window.ticketPlusSelectionDiagnostic({key_json});
+          const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+          const row = [...document.querySelectorAll('[data-ticket-bot-key]')]
+            .find(element => element.dataset.ticketBotKey === {key_json});
+          const nextButtons = [...document.querySelectorAll('button, a')]
+            .filter(element => /下一步|確認張數|立即訂購|建立訂單/.test(clean(element.innerText)))
+            .map(element => ({{
+              text: clean(element.innerText),
+              disabled: Boolean(element.disabled) || element.getAttribute('aria-disabled') === 'true' ||
+                /disabled/.test(clean(element.className)),
+              class_name: clean(element.className)
+            }}));
+          return {{
+            selected_row_text: clean(row && row.innerText),
+            selected_row_class: clean(row && row.className),
+            selected_row_html: String(row && row.outerHTML || '').slice(0, 5000),
+            next_buttons: nextButtons
+          }};
         }})()
         """
         diagnostic = await self.page.evaluate(diagnostic_script)
         logger.error(
-            "Ticket Plus 票區展開後 DOM 診斷：%s",
+            "Ticket Plus 票區選擇診斷：%s",
             json.dumps(diagnostic, ensure_ascii=False),
         )
         raise RuntimeError("Ticket Plus 已選擇票區，但『下一步』按鈕仍未啟用")
@@ -886,9 +877,15 @@ class TicketPlusBot:
                 # 只要處於選區/結帳狀態，或者網址在 /order/ 或 /confirm/，就強制重置超時計數器
                 current_url = str(snapshot.get("page_url", ""))
                 parsed_path = urlparse(current_url).path
-                
-                if state in {"session_select", "ticket_select", "seat_map", "order_review", "payment_boundary"} or "/order/" in parsed_path or "/confirm/" in parsed_path:
-                    state_steps = 0  # ◄ 強制重置計數器，不讓它 20 秒死機
+
+                if state in {
+                    "session_select",
+                    "ticket_select",
+                    "seat_map",
+                    "order_review",
+                    "payment_boundary",
+                } or "/order/" in parsed_path or "/confirm/" in parsed_path:
+                    state_steps = 0 # ◄ 強制重置計數器，不讓它 20 秒死機
 
                 current_url = str(snapshot.get("page_url", ""))
                 is_on_confirm_page = "/confirm/" in current_url or "/checkout/" in current_url or "/payment/" in current_url
@@ -914,6 +911,7 @@ class TicketPlusBot:
                             "price_candidates": snapshot.get("price_candidates", []),
                             "sessions": snapshot.get("sessions", []),
                             "ticket_units": snapshot.get("ticket_units", []),
+                            "order_areas": snapshot.get("order_areas", []),
                         },
                         ensure_ascii=False,
                     )

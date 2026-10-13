@@ -9,6 +9,7 @@ from ticket_bot.platforms.ticketplus_parser import (
     resolve_area_keywords,
     select_adjacent_seats,
     select_session,
+    ticket_units_from_order_areas,
     validate_order_review,
 )
 
@@ -37,6 +38,49 @@ def test_parse_price_accepts_ticketplus_copy():
     assert parse_price("S區 NT$4,000") == 4000
     assert parse_price("一般區 NT2,500") == 2500
     assert parse_price("免費") == 0
+
+
+def test_nested_order_areas_only_expose_leaf_ticket_areas():
+    areas = [
+        {
+            "key": "price-4880",
+            "text": "4880 區 A1區 熱賣中 NT.4,880 A2區 熱賣中 NT.4,880",
+            "disabled": False,
+            "is_leaf": False,
+            "ancestor_keys": [],
+        },
+        {
+            "key": "area-a1",
+            "text": "A1區 熱賣中 NT.4,880",
+            "disabled": False,
+            "is_leaf": True,
+            "ancestor_keys": ["price-4880"],
+        },
+    ]
+
+    units = ticket_units_from_order_areas(areas)
+
+    assert [unit["name"] for unit in units] == ["A1區"]
+    assert units[0]["ancestor_keys"] == ["price-4880"]
+
+
+def test_ticket_plan_keeps_ancestor_keys_for_nested_area_selection():
+    units = [
+        {
+            "key": "area-c1",
+            "name": "C1區",
+            "price": 3880,
+            "available": True,
+            "max_quantity": 4,
+            "general_admission": False,
+            "selection_mode": "area_panel",
+            "ancestor_keys": ["price-3880"],
+        }
+    ]
+
+    plan = build_ticket_plan(make_event(area_keywords=["C"]), units)
+
+    assert plan["ancestor_keys"] == ["price-3880"]
 
 
 def test_page_state_precedence():
@@ -77,6 +121,7 @@ def test_ticket_plan_falls_back_without_breaking_price_limit():
         "price": 2500,
         "quantity": 2,
         "general_admission": True,
+        "selection_mode": "quantity",
     }
 
 

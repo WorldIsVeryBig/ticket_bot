@@ -40,6 +40,37 @@ def _create_platform_bot(cfg, ev, session, use_api: bool = False):
     return TixcraftBot(cfg, ev, session=session)
 
 
+async def _prewarm_countdown_bot(cfg, ev, session):
+    """建立倒數用 bot，並依平台在同一個瀏覽器中完成預熱。"""
+    use_api = ev.platform == "tixcraft" and cfg.browser.api_mode != "off"
+    bot = _create_platform_bot(cfg, ev, session, use_api=use_api)
+    if hasattr(bot, "pre_warm"):
+        await bot.start_browser()
+        await bot.pre_warm()
+    elif ev.platform == "ticketplus":
+        page = await bot._ensure_page()
+        await page.goto(ev.url)
+    else:
+        await bot.start_browser()
+    return bot
+
+
+def _single_invocation(action):
+    """讓 burst 重複觸發時，非重入式瀏覽器流程只執行一次。"""
+    started = False
+    lock = asyncio.Lock()
+
+    async def run_once():
+        nonlocal started
+        async with lock:
+            if started:
+                return False
+            started = True
+        return await action()
+
+    return run_once
+
+
 async def _notify_all(cfg, event_name: str, url: str, status: str, platform: str = "tixcraft") -> None:
     """根據設定發送所有啟用的通知"""
     if cfg.notifications.telegram.enabled and cfg.notifications.telegram.bot_token:
@@ -554,17 +585,20 @@ def countdown(ctx, event, parallel):
 
     cfg = load_config(ctx.obj["config_path"])
 
-    targets = [e for e in cfg.events if e.platform == "tixcraft" and e.sale_time]
+    targets = [
+        e
+        for e in cfg.events
+        if e.platform in SUPPORTED_PURCHASE_PLATFORMS and e.sale_time
+    ]
     if event:
         targets = [e for e in targets if event in e.name]
     if not targets:
-        click.echo("找不到有設定 sale_time 的 tixcraft 活動")
+        click.echo("找不到有設定 sale_time 的支援活動")
         return
 
     sessions = cfg.sessions
 
     async def _countdown():
-        from ticket_bot.platforms.tixcraft import TixcraftBot
         from ticket_bot.utils.timer import countdown_activate
         import time as _time
 
@@ -595,9 +629,7 @@ def countdown(ctx, event, parallel):
             # 預熱所有 sessions
             bots = []
             for sess in sessions:
-                bot = TixcraftBot(cfg, ev, session=sess)
-                await bot.start_browser()
-                await bot.pre_warm()
+                bot = await _prewarm_countdown_bot(cfg, ev, sess)
                 bots.append((bot, sess))
                 click.echo(f"  [{sess.name}] 瀏覽器已預熱")
 
@@ -635,6 +667,33 @@ def countdown(ctx, event, parallel):
                     if first_success:
                         await _notify_all(cfg, ev.name, ev.url, "搶票成功")
 
+                # Ticket Plus 是單一瀏覽器 UI 流程，必須沿用預熱分頁，不能在 burst/watch 重建 bot。
+                if ev.platform == "ticketplus":
+                    if first_success:
+                        click.echo("第一輪成功，保留目前瀏覽器供後續操作。")
+                        return True
+
+                    click.echo("第一輪未成功，沿用目前分頁切換 watch 釋票模式...")
+                    watch_bot, watch_session = bots[0]
+                    success = await watch_bot.watch(interval=5.0)
+                    if success:
+                        ticket_info = getattr(watch_bot, "last_success_info", "") or ""
+                        status_msg = (
+                            f"🎉 釋票搶票成功\n{ticket_info}"
+                            if ticket_info
+                            else "釋票搶票成功"
+                        )
+                        await _notify_all(
+                            cfg,
+                            ev.name,
+                            ev.url,
+                            status_msg,
+                            platform=ev.platform,
+                        )
+                    else:
+                        click.echo(f"[{watch_session.name}] watch 已停止，未建立新瀏覽器。")
+                    return success
+
                 # --- 第一輪結束，自動切換 watch 釋票模式 ---
                 if first_success:
                     click.echo("第一輪成功！自動切換 watch 釋票模式繼續搶...")
@@ -667,7 +726,10 @@ def countdown(ctx, event, parallel):
                         if not success:
                             await watch_bot.close()
 
-            await countdown_activate(sale_time, _go)
+            countdown_action = (
+                _single_invocation(_go) if ev.platform == "ticketplus" else _go
+            )
+            await countdown_activate(sale_time, countdown_action)
 
     asyncio.run(_countdown())
 

@@ -152,6 +152,8 @@ def ticket_units_from_order_areas(areas: list[dict]) -> list[dict]:
     units: list[dict] = []
     seen: set[str] = set()
     for area in areas:
+        if area.get("is_leaf") is False:
+            continue
         key = normalize_text(area.get("key"))
         text = normalize_text(area.get("text"))
         if not key or key in seen or not text:
@@ -188,6 +190,11 @@ def ticket_units_from_order_areas(areas: list[dict]) -> list[dict]:
                     re.search(r"自由入座|自由席|站席|搖滾區|無劃位|一般區", text, re.IGNORECASE)
                 ),
                 "selection_mode": "area_panel",
+                "ancestor_keys": [
+                    normalize_text(value)
+                    for value in area.get("ancestor_keys", [])
+                    if normalize_text(value)
+                ],
             }
         )
     return units
@@ -283,7 +290,7 @@ def build_ticket_plan(event: EventConfig, ticket_units: list[dict]) -> dict:
                 not isinstance(price, int) or price > event.max_price
             ):
                 continue
-            return {
+            plan = {
                 "ticket_key": unit["key"],
                 "ticket_name": name,
                 "price": price,
@@ -291,6 +298,9 @@ def build_ticket_plan(event: EventConfig, ticket_units: list[dict]) -> dict:
                 "general_admission": bool(unit.get("general_admission")),
                 "selection_mode": unit.get("selection_mode", "quantity"),
             }
+            if unit.get("ancestor_keys"):
+                plan["ancestor_keys"] = list(unit["ancestor_keys"])
+            return plan
     raise ValueError("Ticket Plus 找不到符合候選順序、票數與價格上限的票種")
 
 
